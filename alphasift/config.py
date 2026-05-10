@@ -182,7 +182,7 @@ class Config:
     evaluation_price_path_lookback_days: int = 90
 
     # Data directory
-    data_dir: Path = _PROJECT_ROOT / "data"
+    data_dir: Path = Path(os.getenv("ALPHASIFT_DATA_DIR", _PROJECT_ROOT / "data"))
 
     def has_llm_config(self) -> bool:
         """Return whether any supported LiteLLM configuration is present."""
