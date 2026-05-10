@@ -39,6 +39,7 @@ def screen(
     candidate_context_providers: list[str] | None = None,
     industry_map_files: list[str | Path] | None = None,
     industry_provider: str | None = None,
+    fetch_concepts: bool = False,
     post_analyzers: list[str] | None = None,
     post_analysis_max_picks: int | None = None,
     daily_enrich: bool | None = None,
@@ -132,6 +133,7 @@ def screen(
             map_files=effective_industry_map_files,
             provider=effective_industry_provider,
             max_boards=config.industry_provider_max_boards,
+            fetch_concepts=fetch_concepts,
         )
         degradation.extend(f"Industry/concepts enrichment: {item}" for item in industry_notes)
     snapshot_count = len(snapshot_df)
@@ -471,6 +473,10 @@ def _required_snapshot_columns(filters) -> list[str]:
 
 
 def _safe_float(v) -> float | None:
+    # 处理 pandas NA / NaN
+    import pandas as pd
+    if pd.isna(v):
+        return None
     if v is None or v == "" or v == "-":
         return None
     try:

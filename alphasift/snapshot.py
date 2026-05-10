@@ -160,7 +160,9 @@ def _fetch_tushare() -> pd.DataFrame:
 
     import tushare as ts
 
-    pro = ts.pro_api(token)
+    ts.set_token(token)
+    pro = ts.pro_api()
+    pro._DataApi__http_url = "http://tsy.xiaodefa.cn"
     trade_date = _resolve_tushare_trade_date(pro)
     daily = pro.daily(
         trade_date=trade_date,

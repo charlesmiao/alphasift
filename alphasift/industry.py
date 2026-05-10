@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 
@@ -45,6 +46,7 @@ def enrich_industry_concepts(
     map_files: list[str | Path] | None = None,
     provider: str = "none",
     max_boards: int = 80,
+    fetch_concepts: bool = False,
 ) -> tuple[pd.DataFrame, list[str]]:
     """Attach industry/concepts columns from stable files and optional providers."""
     result = df.copy()
@@ -77,6 +79,13 @@ def enrich_industry_concepts(
     if provider and provider.lower() not in {"", "none", "off", "false"}:
         if provider.lower() == "akshare":
             provider_mapping, provider_notes = fetch_akshare_board_map(max_boards=max_boards)
+            _merge_mapping(mapping, provider_mapping)
+            notes.extend(provider_notes)
+        elif provider.lower() == "tushare":
+            provider_mapping, provider_notes = fetch_tushare_board_map(
+                max_boards=max_boards, 
+                skip_concepts=not fetch_concepts
+            )
             _merge_mapping(mapping, provider_mapping)
             notes.extend(provider_notes)
         else:
@@ -209,7 +218,13 @@ def fetch_akshare_board_map(*, max_boards: int = 80) -> tuple[dict[str, dict[str
         except Exception as exc:
             notes.append(f"akshare {field} board list failed: {exc}")
             continue
+        # 调试：记录列名
+        if hasattr(boards, 'columns'):
+            notes.append(f"akshare {field} columns: {list(boards.columns)}")
         board_items = _board_items(boards)[:max(max_boards, 1)]
+        # 调试：记录解析后的数据样本
+        if board_items:
+            notes.append(f"akshare {field} sample item: {board_items[0]}")
         loaded = 0
         for board_item in board_items:
             board = board_item["name"]
@@ -249,6 +264,163 @@ def fetch_akshare_board_map(*, max_boards: int = 80) -> tuple[dict[str, dict[str
                 )
             loaded += 1
         notes.append(f"akshare {field} boards loaded: {loaded}/{len(board_items)}")
+    return mapping, notes
+
+
+def fetch_tushare_board_map(*, max_boards: int = 20, skip_concepts: bool = False, fetch_heat: bool = True) -> tuple[dict[str, dict[str, object]], list[str]]:
+    """Build a code mapping from Tushare industry/concept data.
+    
+    Uses Tushare for basic industry/concept mapping and AkShare for heat data.
+    Requires Tushare Pro 15000+ credits for concept endpoints.
+    
+    Note: Concept data requires one API call per concept board, which is slow.
+    Default max_boards reduced to 20 for performance. Set skip_concepts=True to fetch
+    only industry data (fast, ~2s).
+    
+    Args:
+        max_boards: Max number of concept boards to fetch (default 20, set 0 to skip)
+        skip_concepts: If True, skip concept data entirely (fast mode)
+        fetch_heat: If True, fetch heat data from AkShare (adds ~10-20s)
+    """
+    import tushare as ts
+    
+    mapping: dict[str, dict[str, object]] = {}
+    notes: list[str] = []
+    
+    # Get Tushare token from environment variable
+    token = os.getenv("TUSHARE_TOKEN", "")
+    if not token:
+        notes.append("tushare board map skipped: no token configured")
+        return mapping, notes
+    
+    try:
+        ts.set_token(token)
+        pro = ts.pro_api()
+        # Apply custom URL (consistent with snapshot.py)
+        pro._DataApi__http_url = "http://tsy.xiaodefa.cn"
+    except Exception as exc:
+        notes.append(f"tushare board map failed: {exc}")
+        return mapping, notes
+    
+    # 1. Fetch industry data from stock_basic
+    try:
+        stock_basic = pro.stock_basic(
+            exchange="",
+            list_status="L",
+            fields="ts_code,symbol,name,industry",
+        )
+        if stock_basic is not None and not stock_basic.empty:
+            for _, row in stock_basic.iterrows():
+                code = _normalize_code(row.get("ts_code") or row.get("symbol"))
+                if not code or code == "000000":
+                    continue
+                industry = _safe_text(row.get("industry"))
+                if industry:
+                    item = mapping.setdefault(code, {"industry": "", "concepts": ""})
+                    if not item["industry"]:
+                        item["industry"] = industry
+            notes.append(f"tushare industry loaded from stock_basic: {len(stock_basic)} stocks")
+    except Exception as exc:
+        notes.append(f"tushare industry fetch failed: {exc}")
+    
+    # 2. Fetch concept data (optional, can be slow)
+    if not skip_concepts and max_boards > 0:
+        try:
+            # Get concept list
+            concept_list = pro.concept()
+            if concept_list is None or concept_list.empty:
+                notes.append("tushare concept list empty")
+            else:
+                notes.append(f"tushare concept list loaded: {len(concept_list)} concepts")
+                
+                # Limit concepts to fetch (each requires an API call)
+                concepts_to_fetch = concept_list.head(max_boards)
+                loaded_concepts = 0
+                
+                for _, concept_row in concepts_to_fetch.iterrows():
+                    concept_code = concept_row.get("code", "")
+                    concept_name = concept_row.get("name", "")
+                    if not concept_code:
+                        continue
+                    
+                    try:
+                        # Fetch concept members (one API call per concept)
+                        members = pro.concept_detail(id=concept_code, fields="ts_code,name")
+                        if members is None or members.empty:
+                            continue
+                        
+                        for _, member in members.iterrows():
+                            code = _normalize_code(member.get("ts_code"))
+                            if not code or code == "000000":
+                                continue
+                            item = mapping.setdefault(code, {"industry": "", "concepts": ""})
+                            # Merge concept name
+                            item["concepts"] = _merge_label_text(item["concepts"], concept_name)
+                        
+                        loaded_concepts += 1
+                    except Exception as exc:
+                        notes.append(f"tushare concept {concept_name}({concept_code}) skipped: {exc}")
+                        continue
+                
+                notes.append(f"tushare concepts loaded: {loaded_concepts}/{len(concepts_to_fetch)}")
+        except Exception as exc:
+            notes.append(f"tushare concept fetch failed: {exc}")
+    elif skip_concepts:
+        notes.append("tushare concepts skipped (fast mode)")
+    
+    # 3. Fetch heat data from Tushare ths_hot (optional, for industry/concept rankings)
+    if fetch_heat and mapping:
+        try:
+            # Use Tushare ths_hot to get heat data
+            ths_data = pro.ths_hot()
+            if ths_data is not None and not ths_data.empty:
+                notes.append(f"tushare ths_hot loaded: {len(ths_data)} items")
+                
+                # Map heat data by stock code
+                for _, row in ths_data.iterrows():
+                    code = _normalize_code(row.get("code"))
+                    if not code or code == "000000":
+                        continue
+                    
+                    # Extract heat metrics
+                    heat_score = _safe_float(row.get("score"))
+                    rank = _safe_float(row.get("rank"))
+                    change_pct = _safe_float(row.get("pct_chg"))
+                    
+                    if heat_score is not None or rank is not None or change_pct is not None:
+                        item = mapping.setdefault(code, {"industry": "", "concepts": ""})
+                        if heat_score is not None:
+                            item["board_heat_score"] = heat_score
+                        if rank is not None:
+                            item["industry_rank"] = rank
+                        if change_pct is not None:
+                            item["industry_change_pct"] = change_pct
+                        # Create summary
+                        summary_parts = []
+                        if rank is not None:
+                            summary_parts.append(f"rank={int(rank)}")
+                        if change_pct is not None:
+                            summary_parts.append(f"{change_pct:+.2f}%")
+                        if summary_parts:
+                            item["board_heat_summary"] = ":".join(summary_parts)
+                
+                notes.append(f"tushare ths_hot heat data merged")
+            else:
+                notes.append("tushare ths_hot returned empty data")
+        except Exception as exc:
+            notes.append(f"tushare ths_hot fetch failed: {exc}")
+            # Fallback to AkShare if Tushare fails
+            try:
+                heat_mapping, heat_notes = fetch_akshare_board_map(max_boards=50)
+                for code, item in mapping.items():
+                    heat_item = heat_mapping.get(code, {})
+                    for field in _HEAT_FIELDS:
+                        if field in heat_item and heat_item[field] is not None:
+                            item[field] = heat_item[field]
+                notes.extend([f"fallback to akshare heat data: {len(heat_mapping)} items"] + heat_notes)
+            except Exception as exc2:
+                notes.append(f"akshare fallback also failed: {exc2}")
+    
     return mapping, notes
 
 

@@ -139,7 +139,8 @@ def main():
     sp.add_argument("--explain", action="store_true", help="输出紧凑可读摘要")
 
     # strategies
-    sub.add_parser("strategies", help="列出可用策略")
+    stp = sub.add_parser("strategies", help="列出可用策略")
+    stp.add_argument("--json", action="store_true", help="以 JSON 输出")
 
     # evaluate
     ep = sub.add_parser("evaluate", help="用最新快照评估已保存的选股结果")
@@ -170,6 +171,8 @@ def main():
     # runs
     rp = sub.add_parser("runs", help="列出已保存的运行")
     rp.add_argument("--limit", type=int, default=20)
+    rp.add_argument("--strategy", default=None, help="筛选特定策略")
+    rp.add_argument("--json", action="store_true", help="以 JSON 输出")
 
     # industry-cache
     icp = sub.add_parser("industry-cache", help="刷新行业/概念映射缓存文件")
@@ -235,13 +238,27 @@ def main():
             print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
 
     elif args.command == "strategies":
-        for s in list_strategies():
-            tags = ",".join(s.tags)
-            suffix = f" tags={tags}" if tags else ""
-            print(
-                f"  {s.name:<25} {s.display_name:<10} "
-                f"v{s.version:<5} [{s.category}] {s.description}{suffix}"
-            )
+        strategies = list_strategies()
+        if args.json:
+            strategies_list = []
+            for s in strategies:
+                strategies_list.append({
+                    "id": s.name,
+                    "name": s.display_name,
+                    "version": s.version,
+                    "type": s.category,
+                    "description": s.description,
+                    "tags": s.tags,
+                })
+            print(json.dumps({"strategies": strategies_list}, ensure_ascii=False))
+        else:
+            for s in strategies:
+                tags = ",".join(s.tags)
+                suffix = f" tags={tags}" if tags else ""
+                print(
+                    f"  {s.name:<25} {s.display_name:<10} "
+                    f"v{s.version:<5} [{s.category}] {s.description}{suffix}"
+                )
 
     elif args.command == "evaluate":
         config = Config.from_env()
@@ -290,11 +307,28 @@ def main():
 
     elif args.command == "runs":
         config = Config.from_env()
-        for item in list_saved_runs(data_dir=config.data_dir, limit=args.limit):
-            print(
-                f"{item['run_id']:<14} {item['strategy']:<20} "
-                f"{item['created_at']:<26} picks={item['picks']} {item['path']}"
-            )
+        runs = list_saved_runs(data_dir=config.data_dir, limit=args.limit)
+        # 本地筛选策略
+        if args.strategy:
+            runs = [r for r in runs if r["strategy"] == args.strategy]
+        if args.json:
+            runs_list = []
+            for item in runs:
+                runs_list.append({
+                    "run_id": item["run_id"],
+                    "strategy": item["strategy"],
+                    "created_at": item["created_at"],
+                    "picks_count": item["picks"],
+                    "llm_ranked": item.get("llm_ranked", False),
+                    "source": item.get("source", ""),
+                })
+            print(json.dumps({"runs": runs_list}, ensure_ascii=False))
+        else:
+            for item in runs:
+                print(
+                    f"{item['run_id']:<14} {item['strategy']:<20} "
+                    f"{item['created_at']:<26} picks={item['picks']} {item['path']}"
+                )
 
     elif args.command == "industry-cache":
         mapping, notes = fetch_akshare_board_map(max_boards=args.max_boards)
